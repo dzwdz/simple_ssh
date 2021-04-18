@@ -1,13 +1,17 @@
 #!/usr/bin/env ruby
 require 'digest'
 require 'socket'
+require 'openssl'
 
 ID_STRING  = "SSH-2.0-simple"
 
-# literally wikipedia example numbers
-HOST_KEY_N = 2**1024 # 3233
-HOST_KEY_E = 17
+# this is a mess. look at host_key.txt
+# https://en.wikipedia.org/wiki/RSA_(cryptosystem)#Example
+HOST_KEY_N = 0x00ba347401332387e176d7defeb31e64cd5106758156e3e5aa50b6a4881929dbcbaf80acb35f6db187d12f7511990587c0a1f021a8f366177af43f0565a9005c54b073a5d21589e5f368f769be6ff418144197e64e1560c3337bb90321d4da95a79a076126234b758f7272e5b5091dc32d0726810f72e918a5a3fec1be70e9a39b5116d8cfd16779143740caa730be858bef7309413b824a0bf19a64ba569820d7d6c44de6356cdbb00e702044e25c0b16f137c82f7299ee45cde3dccc731393a961bb35d82841b9be20804bc54eb256fe02020fb57453519f2563f19b2a87d90776602f2fb07c870d2ae39a4444d8ff0e2047f65f7f9fbb25a781fe2e8939ac55
+HOST_KEY_E = 0x10001
+HOST_KEY_D = 0x008f5d716fb70b0544cff6d767ad4b9a7b06867d946eed1ad82e3ae1a53412a97b430e4469faf07f3ebe0dd70a0c92587a3574a8c5e759547cc36f7e5d4e68cbae1d097dc3a9f7b987d6ea9f8d13af91968f064039207696f49daece3d8f201917a91d436c54c275aa5389295960c27c92bfada2b2dd5ba1316f79e77c147d9f0bd665915f1f083236edf12e8f5a51636be3aae7ab11b5c9dfd0ec15ade3ae8a3813c8a578a4a64569aeb0602ea63566f6f345331fa01ec7e961c6d572ee3307f01c9a1c4cdb00a5beb3b2ce2c876b9bcccea0f7bf6c10b931e79850f2ae943ca918dd7645ff1312dd6fd5a9952db168cf4a054fb5665613e1fa667fb274d20781
 
+HOST_KEY = OpenSSL::PKey::RSA.new File.read 'host_key'
 
 class String
   def bytes
@@ -16,6 +20,35 @@ class String
 end
 
 class Array
+  def hexdump
+    pos = 0
+    each_slice(16) do |s|
+      print pos.to_s.rjust 4
+      print ": "
+
+      s.each {|d| print d.to_s(16).rjust(2, '0') + " "}
+      print " "
+
+      s.each do |d|
+        c = d.chr
+        if c =~ /[^[:print:]]/
+          print '.'
+        else
+          print c
+        end
+      end
+
+      puts
+      pos += 16
+    end
+  end
+
+  def to_i
+    val = 0
+    each {|d| val = val * 256 + d}
+    val
+  end
+
   # all of those functions are only meant to be used with byte arrays
   # they strip the type from the beginning and return it
   #
@@ -27,17 +60,18 @@ class Array
 
   def mpint
     len = uint32
-    val = 0
-    shift(len).each do |d|
-      val = val * 256 + d
-    end
+    val = shift(len).to_i
     # todo negatives
     val
   end
 
-  def name_list
+  def string
     len = uint32
-    shift(len).map(&:chr).join.split(',')
+    shift(len).map(&:chr).join
+  end
+
+  def name_list
+    string.split(',')
   end
 end
 
@@ -193,7 +227,8 @@ def algo_negotiation cl
 
   _reserved = packet.uint32
 
-  payload + packet_copy # we return the combined payloads for use in the key exchange
+  ssh_string(packet_copy.map(&:chr).join) +
+    ssh_string(payload.map(&:chr).join) # we return the combined payloads for use in the key exchange
 end
 
 # RFC 3526 / 3.
@@ -228,20 +263,29 @@ def key_exchange cl, client_id, combined_payloads
   payload += ssh_pmint f
 
   # and sending the signature
-  sha = Digest::SHA256.new
-  sha << client_id                         # V_C
-  sha << ID_STRING                         # V_S
-  sha << combined_payloads.map(&:chr).join # I_C || I_S
-  sha << encoded_host_key                  # K_S
-  sha << ssh_pmint(e).map(&:chr).join      # e
-  sha << ssh_pmint(f).map(&:chr).join      # f
-  sha << ssh_pmint(k).map(&:chr).join      # K
+  # first we prepare the hash
+  buf  = []
+  buf += ssh_string client_id              # V_C
+  buf += ssh_string ID_STRING              # V_S
+  buf += combined_payloads                 # I_C || I_S
+  buf += ssh_string encoded_host_key       # K_S
+  buf += ssh_pmint e                       # e
+  buf += ssh_pmint f                       # f
+  buf += ssh_pmint k                       # K
+  buf = buf.map(&:chr).join
+  hash = Digest::SHA256.digest buf
+  hash = Digest::SHA1.digest   hash # dumb SSH bullshit
+  
+  digest_info = [0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14].map(&:chr).join
 
-  hash = sha.hexdigest
+  # sign it using RSA
+  signed_hash = HOST_KEY.private_encrypt(digest_info + hash)
+  p signed_hash
+  p signed_hash.length
 
   # RFC 4253 / 6.6.
   signature  = ssh_string "ssh-rsa"
-  signature += ssh_string "penis"
+  signature += ssh_string signed_hash
   signature  = signature.map(&:chr).join
   payload   += ssh_string signature
  
