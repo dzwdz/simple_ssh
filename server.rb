@@ -3,7 +3,9 @@ require 'digest'
 require 'socket'
 require 'openssl'
 
+# i've split off the stuff that isn't specific to SSH into seperate files
 require_relative 'utility'
+require_relative 'crypto'
 
 
 ID_STRING  = "SSH-2.0-simple"
@@ -129,27 +131,6 @@ end
 
 
 
-# we also need some crypto primitives - those will get split off to a seperate
-# file later on
-
-# RFC 3447 / 8.2.1.
-# i assume SHA1 as the hash function used
-def rsa_sign str
-  # RFC 3447 / 9.2.
-  hash = Digest::SHA1.digest str
-
-  # RFC 3447 / page 43
-  digest_info = [0x30, 0x21, 0x30, 0x09, 0x06,
-                 0x05, 0x2b, 0x0e, 0x03, 0x02,
-                 0x1a, 0x05, 0x00, 0x04, 0x14].map(&:chr).join
-
-  # i don't do the padding, openssl does that for me
-  # i'll reimplement RSA later on
-  signature = HOST_KEY.private_encrypt(digest_info + hash)
-end
-
-
-
 # and now we can get into the actual protocol implementation
 
 def handle_client cl
@@ -162,6 +143,7 @@ def handle_client cl
 
 
     combined_payloads = algo_negotiation cl
+
     # since this is a toy implementation that only supports one algorithm for
     # everything, i don't have to pass the negotiated algos around - they're
     # always the same
@@ -198,42 +180,39 @@ def algo_negotiation cl
 
 
   # parsing the client's packet
-  # this is a big, ugly block of code - sorry for that
+  # basically, we get a bunch of name_lists of the supported algorithms
+  #
+  # all we have to do in this implementation is to verify that the client
+  # supports the algos which we use
   packet = cl.read_packet
   packet_copy = packet.dup
-  raise "invalid packet" unless
-    packet.shift == 20 # SSH_MSG_KEXINIT
 
+  assert packet.shift == 20 # SSH_MSG_KEXINIT
   client_cookie         = packet.shift 16
-  kex_algorithms        = packet.name_list
-  raise "unsupported" unless
-    kex_algorithms.include? "diffie-hellman-group14-sha256"
 
-  server_host_key_algos = packet.name_list 
-  raise "unsupported" unless
-    server_host_key_algos.include? "ssh-rsa"
 
-  encryption_algos_c2s  = packet.name_list 
-  encryption_algos_s2c  = packet.name_list 
-  raise "unsupported" unless
-    encryption_algos_c2s.include? "aes256-ctr" and
-    encryption_algos_s2c.include? "aes256-ctr"
+  # key exchange method
+  assert packet.name_list.include? "diffie-hellman-group14-sha256"
 
-  mac_algos_c2s         = packet.name_list 
-  mac_algos_s2c         = packet.name_list 
-  raise "unsupported" unless
-    mac_algos_c2s.include? "hmac-sha2-256" and
-    mac_algos_s2c.include? "hmac-sha2-256"
+  # server host key type
+  assert packet.name_list.include? "ssh-rsa"
 
-  compression_algos_c2s = packet.name_list 
-  compression_algos_s2c = packet.name_list 
-  raise "unsupported" unless
-    compression_algos_c2s.include? "none" and
-    compression_algos_s2c.include? "none"
+  # encryption algo
+  assert packet.name_list.include? "aes256-ctr" # c2s
+  assert packet.name_list.include? "aes256-ctr" # s2c
+
+  # MAC algo
+  assert packet.name_list.include? "hmac-sha2-256" # c2s
+  assert packet.name_list.include? "hmac-sha2-256" # s2c
+
+  # compression algo
+  assert packet.name_list.include? "none" # c2s
+  assert packet.name_list.include? "none" # s2c
 
   # we don't care about those
   _languages_c2s        = packet.name_list
   _languages_s2c        = packet.name_list
+
 
   first_kex_packet_follows = packet.shift != 0
   raise "unsupported" if first_kex_packet_follows # TODO
@@ -241,7 +220,7 @@ def algo_negotiation cl
   _reserved = packet.uint32
 
 
-  # ok, we've "negotiated" the protocols
+  # ok, we've "negotiated" the algortihms used
   # one last thing - we return the combined client + server payloads
   # we need those in the key exchange
 
@@ -258,8 +237,7 @@ DH14P = 0xFFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBE
 def key_exchange cl, client_id, combined_payloads
   ### 1. the client sends us E
   packet = cl.read_packet
-  raise "invalid packet" unless
-    packet.shift == 30 # SSH_MSG_KEXDH_INIT
+  assert packet.shift == 30 # SSH_MSG_KEXDH_INIT
   e = packet.mpint # todo verify that e is in [1, p-1]
 
 

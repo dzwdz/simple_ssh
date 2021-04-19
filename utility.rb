@@ -37,3 +37,7 @@ class Array
     val
   end
 end
+
+def assert val
+  raise "assertion failed" unless val
+end
