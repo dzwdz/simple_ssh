@@ -5,12 +5,6 @@ require 'openssl'
 
 ID_STRING  = "SSH-2.0-simple"
 
-# this is a mess. look at host_key.txt
-# https://en.wikipedia.org/wiki/RSA_(cryptosystem)#Example
-HOST_KEY_N = 0x00ba347401332387e176d7defeb31e64cd5106758156e3e5aa50b6a4881929dbcbaf80acb35f6db187d12f7511990587c0a1f021a8f366177af43f0565a9005c54b073a5d21589e5f368f769be6ff418144197e64e1560c3337bb90321d4da95a79a076126234b758f7272e5b5091dc32d0726810f72e918a5a3fec1be70e9a39b5116d8cfd16779143740caa730be858bef7309413b824a0bf19a64ba569820d7d6c44de6356cdbb00e702044e25c0b16f137c82f7299ee45cde3dccc731393a961bb35d82841b9be20804bc54eb256fe02020fb57453519f2563f19b2a87d90776602f2fb07c870d2ae39a4444d8ff0e2047f65f7f9fbb25a781fe2e8939ac55
-HOST_KEY_E = 0x10001
-HOST_KEY_D = 0x008f5d716fb70b0544cff6d767ad4b9a7b06867d946eed1ad82e3ae1a53412a97b430e4469faf07f3ebe0dd70a0c92587a3574a8c5e759547cc36f7e5d4e68cbae1d097dc3a9f7b987d6ea9f8d13af91968f064039207696f49daece3d8f201917a91d436c54c275aa5389295960c27c92bfada2b2dd5ba1316f79e77c147d9f0bd665915f1f083236edf12e8f5a51636be3aae7ab11b5c9dfd0ec15ade3ae8a3813c8a578a4a64569aeb0602ea63566f6f345331fa01ec7e961c6d572ee3307f01c9a1c4cdb00a5beb3b2ce2c876b9bcccea0f7bf6c10b931e79850f2ae943ca918dd7645ff1312dd6fd5a9952db168cf4a054fb5665613e1fa667fb274d20781
-
 HOST_KEY = OpenSSL::PKey::RSA.new File.read 'host_key'
 
 class String
@@ -43,6 +37,7 @@ class Array
     end
   end
 
+  # parses a byte array, most significant byte first
   def to_i
     val = 0
     each {|d| val = val * 256 + d}
@@ -235,6 +230,22 @@ end
 # prime used for the DH key exchange
 DH14P = 0xFFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF
 
+# RFC 3447 / 8.2.1.
+# i assume SHA1 as the hash function used
+def rsa_sign str
+  # RFC 3447 / 9.2.
+  hash = Digest::SHA1.digest str
+
+  # RFC 3447 / page 43
+  digest_info = [0x30, 0x21, 0x30, 0x09, 0x06,
+                 0x05, 0x2b, 0x0e, 0x03, 0x02,
+                 0x1a, 0x05, 0x00, 0x04, 0x14].map(&:chr).join
+
+  # i don't do the padding, openssl does that for me
+  # i'll reimplement RSA later on
+  signature = HOST_KEY.private_encrypt(digest_info + hash)
+end
+
 # RFC 4253 / 8.
 # using diffie-hellman-group14-sha256
 def key_exchange cl, client_id, combined_payloads
@@ -250,8 +261,8 @@ def key_exchange cl, client_id, combined_payloads
   
   # encoded according to RFC 4253 / 6.6.
   encoded_host_key  = ssh_string "ssh-rsa"
-  encoded_host_key += ssh_pmint HOST_KEY_E
-  encoded_host_key += ssh_pmint HOST_KEY_N
+  encoded_host_key += ssh_pmint HOST_KEY.params['e'].to_i
+  encoded_host_key += ssh_pmint HOST_KEY.params['n'].to_i
   encoded_host_key  = encoded_host_key.map(&:chr).join # convert to string
   payload += ssh_string encoded_host_key
 
@@ -274,24 +285,14 @@ def key_exchange cl, client_id, combined_payloads
   buf += ssh_pmint k                       # K
   buf = buf.map(&:chr).join
   hash = Digest::SHA256.digest buf
-  hash = Digest::SHA1.digest   hash # dumb SSH bullshit
-  
-  digest_info = [0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14].map(&:chr).join
 
-  # sign it using RSA
-  signed_hash = HOST_KEY.private_encrypt(digest_info + hash)
-  p signed_hash
-  p signed_hash.length
-
+  # and then we send the signature
   # RFC 4253 / 6.6.
   signature  = ssh_string "ssh-rsa"
-  signature += ssh_string signed_hash
+  signature += ssh_string rsa_sign hash
   signature  = signature.map(&:chr).join
   payload   += ssh_string signature
  
-#  The value for 'rsa_signature_blob' is encoded as a string containing
-#  s (which is an integer, without lengths or padding, unsigned, and in
-#  network byte order).
   cl.send_packet payload
 end
 
