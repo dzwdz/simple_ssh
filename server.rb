@@ -3,51 +3,21 @@ require 'digest'
 require 'socket'
 require 'openssl'
 
-ID_STRING  = "SSH-2.0-simple"
+require_relative 'utility'
 
+
+ID_STRING  = "SSH-2.0-simple"
 HOST_KEY = OpenSSL::PKey::RSA.new File.read 'host_key'
 
-class String
-  def bytes
-    each_char.map(&:ord)
-  end
-end
+
+
+
+# first off - we need functions for handling the SSH types
+# RFC 4251 / 5.
 
 class Array
-  def hexdump
-    pos = 0
-    each_slice(16) do |s|
-      print pos.to_s.rjust 4
-      print ": "
-
-      s.each {|d| print d.to_s(16).rjust(2, '0') + " "}
-      print " "
-
-      s.each do |d|
-        c = d.chr
-        if c =~ /[^[:print:]]/
-          print '.'
-        else
-          print c
-        end
-      end
-
-      puts
-      pos += 16
-    end
-  end
-
-  # parses a byte array, most significant byte first
-  def to_i
-    val = 0
-    each {|d| val = val * 256 + d}
-    val
-  end
-
   # all of those functions are only meant to be used with byte arrays
-  # they strip the type from the beginning and return it
-  #
-  # definitions of all those types (and those below too) are in RFC 4251 / 5.
+  # they strip the value from the beginning and return it
 
   def uint32
     shift(4).pack('C*').unpack('N').first
@@ -113,6 +83,7 @@ class TCPSocket
   end
 end
 
+# those return byte arrays
 def ssh_byte i
   [i.ord]
 end
@@ -126,7 +97,6 @@ def ssh_string s
   ssh_uint32(a.length) + a
 end
 
-# awful
 def ssh_pmint i
   # convert negative numbers
   negative = false
@@ -158,6 +128,49 @@ def ssh_pmint i
 end
 
 
+
+# we also need some crypto primitives - those will get split off to a seperate
+# file later on
+
+# RFC 3447 / 8.2.1.
+# i assume SHA1 as the hash function used
+def rsa_sign str
+  # RFC 3447 / 9.2.
+  hash = Digest::SHA1.digest str
+
+  # RFC 3447 / page 43
+  digest_info = [0x30, 0x21, 0x30, 0x09, 0x06,
+                 0x05, 0x2b, 0x0e, 0x03, 0x02,
+                 0x1a, 0x05, 0x00, 0x04, 0x14].map(&:chr).join
+
+  # i don't do the padding, openssl does that for me
+  # i'll reimplement RSA later on
+  signature = HOST_KEY.private_encrypt(digest_info + hash)
+end
+
+
+
+# and now we can get into the actual protocol implementation
+
+def handle_client cl
+  begin
+    # version exchange
+    # todo not spec compliant
+    client_id = cl.gets.delete_suffix("\r\n")
+    puts client_id + " connected"
+    cl.write ID_STRING + "\r\n"
+
+
+    combined_payloads = algo_negotiation cl
+    # since this is a toy implementation that only supports one algorithm for
+    # everything, i don't have to pass the negotiated algos around - they're
+    # always the same
+    key_exchange cl, client_id, combined_payloads
+  ensure
+    cl.close
+  end
+end
+
 # RFC 4253 / 7.
 def algo_negotiation cl
   # let's prepare our packet first
@@ -165,6 +178,8 @@ def algo_negotiation cl
 
   payload  = [20] # SSH_MSG_KEXINIT
   payload += our_cookie
+
+  # those are our algorithm preferences
   payload += ssh_string "diffie-hellman-group14-sha256" # key exchange
   payload += ssh_string "ssh-rsa"                       # server host key
   payload += ssh_string "aes256-ctr"                    # c2s encryption
@@ -175,12 +190,15 @@ def algo_negotiation cl
   payload += ssh_string "none"                          # s2c ^
   payload += ssh_string ""                              # c2s languages
   payload += ssh_string ""                              # s2c ^
+
   payload += [0]          # no kex packet follows
   payload += ssh_uint32 0 # reserved
   
   cl.send_packet payload
 
+
   # parsing the client's packet
+  # this is a big, ugly block of code - sorry for that
   packet = cl.read_packet
   packet_copy = packet.dup
   raise "invalid packet" unless
@@ -222,29 +240,18 @@ def algo_negotiation cl
 
   _reserved = packet.uint32
 
+
+  # ok, we've "negotiated" the protocols
+  # one last thing - we return the combined client + server payloads
+  # we need those in the key exchange
+
   ssh_string(packet_copy.map(&:chr).join) +
-    ssh_string(payload.map(&:chr).join) # we return the combined payloads for use in the key exchange
+    ssh_string(payload.map(&:chr).join)
 end
 
 # RFC 3526 / 3.
 # prime used for the DH key exchange
 DH14P = 0xFFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA051015728E5A8AACAA68FFFFFFFFFFFFFFFF
-
-# RFC 3447 / 8.2.1.
-# i assume SHA1 as the hash function used
-def rsa_sign str
-  # RFC 3447 / 9.2.
-  hash = Digest::SHA1.digest str
-
-  # RFC 3447 / page 43
-  digest_info = [0x30, 0x21, 0x30, 0x09, 0x06,
-                 0x05, 0x2b, 0x0e, 0x03, 0x02,
-                 0x1a, 0x05, 0x00, 0x04, 0x14].map(&:chr).join
-
-  # i don't do the padding, openssl does that for me
-  # i'll reimplement RSA later on
-  signature = HOST_KEY.private_encrypt(digest_info + hash)
-end
 
 # RFC 4253 / 8.
 # using diffie-hellman-group14-sha256
@@ -286,33 +293,17 @@ def key_exchange cl, client_id, combined_payloads
   buf = buf.map(&:chr).join
   hash = Digest::SHA256.digest buf
 
-  # and then we send the signature
+  # then we prepare the signature
   # RFC 4253 / 6.6.
   signature  = ssh_string "ssh-rsa"
   signature += ssh_string rsa_sign hash
   signature  = signature.map(&:chr).join
+
+  # and we append it to the payload
   payload   += ssh_string signature
  
   cl.send_packet payload
 end
-
-def handle_client cl
-  begin
-    # version exchange
-    # todo not spec compliant
-    client_id = cl.gets.delete_suffix("\r\n")
-    puts client_id + " connected"
-    cl.write ID_STRING + "\r\n"
-
-    combined_payloads = algo_negotiation cl
-    # since this is a toy implementation i don't have to carry all the
-    # negotiated algos arounds - only one of each is supported
-    key_exchange cl, client_id, combined_payloads
-  ensure
-    cl.close
-  end
-end
-
 
 
 STDOUT.sync = true
