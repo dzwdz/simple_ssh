@@ -54,9 +54,10 @@ def HMAC_SHA2_256 key, msg
 end
 
 
-# dumb wrapper function
+# dumb wrapper functions
 class TCPSocket
   attr_accessor :c2s_cipher
+  attr_accessor :s2c_cipher
 
   def proxy_read len
     arr = read(len).bytes
@@ -64,5 +65,12 @@ class TCPSocket
       arr = arr.xor @c2s_cipher
     end
     arr.map(&:chr).join
+  end
+
+  def proxy_send arr
+    if @s2c_cipher
+      arr = arr.xor @s2c_cipher
+    end
+    send arr.map(&:chr).join, 0
   end
 end

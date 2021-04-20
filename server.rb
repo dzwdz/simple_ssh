@@ -45,6 +45,7 @@ class TCPSocket
   # proxy_read is provided by crypto.rb
   # it just decrypts the bytes that it reads
   attr_accessor :c2s_mac
+  attr_accessor :s2c_mac
  
   def read_byte
     proxy_read(1).ord
@@ -84,7 +85,8 @@ class TCPSocket
 
   def send_packet payload
     # min of (8, cipher block size)
-    multiple = 8
+    # but like, we can just keep it at the cipher block size
+    multiple = 16
 
     # 4 + 1 + payload.length + padding_length = 0 (mod multiple)
     # padding_length = - 5 - payload.length (mod multiple)
@@ -96,11 +98,21 @@ class TCPSocket
     packet += ssh_byte padding_length
     packet += payload
     packet += [0] * padding_length # Random.bytes(padding_length).bytes
-    # todo mac
-    padding_length
-    packet
 
-    send packet.map(&:chr).join, 0
+    proxy_send packet
+
+    # MAC stuff, look at the previous function
+    # we're sending it after the rest of the packet, because it isn't encrypted
+    # (and the proxy_send function encrypts everything)
+    @s2c_seq ||= 0
+    if @s2c_mac
+      to_mac  = ssh_uint32 @s2c_seq
+      to_mac += packet
+
+      mac = HMAC_SHA2_256(@s2c_mac, to_mac)
+      send mac.map(&:chr).join, 0
+    end
+    @s2c_seq += 1
   end
 end
 
@@ -168,7 +180,8 @@ def handle_client cl
     # always the same
     key_exchange cl, client_id, combined_payloads
 
-    cl.read_packet.hexdump
+    cl.read_packet
+    cl.send_packet [6] + ssh_string("ssh-userauth")
   ensure
     cl.close
   end
@@ -321,6 +334,8 @@ def key_exchange cl, client_id, combined_payloads
 
   cl.c2s_cipher = AES256_ctr(key_c2s, iv_c2s)
   cl.c2s_mac = itg_c2s
+  cl.s2c_cipher = AES256_ctr(key_s2c, iv_s2c)
+  cl.s2c_mac = itg_s2c
 end
 
 
