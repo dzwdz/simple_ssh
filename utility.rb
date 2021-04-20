@@ -36,6 +36,27 @@ class Array
     each {|d| val = val * 256 + d}
     val
   end
+
+  # increments a MSB byte array in-place
+  def increment
+    i = length - 1
+    while i >= 0
+      self[i] += 1
+      break unless self[i] > 255
+      self[i] = 0
+      i -= 1
+    end
+  end
+
+  # xors an array with an enumerator
+  # this implementation is a bit dumb, it's a ruby bug workaround
+  def xor(b)
+    map {|x| x ^ b.next}
+  end
+
+  # copypasted from https://stackoverflow.com/a/5609035
+  def rjust(n, x); Array.new([0, n-length].max, x)+self end
+  def ljust(n, x); dup.fill(x, length...n) end
 end
 
 def assert val

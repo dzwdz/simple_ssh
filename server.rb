@@ -1,5 +1,4 @@
 #!/usr/bin/env ruby
-require 'digest'
 require 'socket'
 require 'openssl'
 
@@ -43,22 +42,42 @@ class Array
 end
 
 class TCPSocket
+  # proxy_read is provided by crypto.rb
+  # it just decrypts the bytes that it reads
+  attr_accessor :c2s_mac
+ 
   def read_byte
-    read(1).ord
+    proxy_read(1).ord
   end
 
   def read_uint32
-    read(4).unpack('N').first
+    proxy_read(4).unpack('N').first
   end
 
   # RFC 4253 / 6.
   def read_packet
     packet_length = read_uint32
     padding_length = read_byte
-    payload = read(packet_length - padding_length - 1).bytes
-    padding = read(padding_length).bytes
+    payload = proxy_read(packet_length - padding_length - 1).bytes
+    padding = proxy_read(padding_length).bytes
 
-    # todo mac
+    # RFC 4253 / 6.4.
+    # we always have to keep track of the sequence number, but we only check
+    # for the MAC if we've negotiated a method and the key
+    @c2s_seq ||= 0
+    if @c2s_mac
+      mac = read(32).bytes
+
+      # we have to reconstruct the packet back, due to the way in which i'm reading it
+      msg  = ssh_uint32 @c2s_seq
+      msg += ssh_uint32 packet_length
+      msg += ssh_byte padding_length
+      msg += payload
+      msg += padding
+
+      raise "invalid HMAC" if HMAC_SHA2_256(@c2s_mac, msg) != mac
+    end
+    @c2s_seq += 1
     
     payload
   end
@@ -148,6 +167,8 @@ def handle_client cl
     # everything, i don't have to pass the negotiated algos around - they're
     # always the same
     key_exchange cl, client_id, combined_payloads
+
+    cl.read_packet.hexdump
   ensure
     cl.close
   end
@@ -268,8 +289,7 @@ def key_exchange cl, client_id, combined_payloads
   buf += ssh_pmint e                       # e
   buf += ssh_pmint f                       # f
   buf += ssh_pmint k                       # K
-  buf = buf.map(&:chr).join
-  hash = Digest::SHA256.digest buf
+  hash = SHA256 buf
 
   # then we prepare the signature
   # RFC 4253 / 6.6.
@@ -281,11 +301,31 @@ def key_exchange cl, client_id, combined_payloads
   payload   += ssh_string signature
  
   cl.send_packet payload
+
+
+  # now the client should send SSH2_MSG_NEWKEYS
+  packet = cl.read_packet
+  assert packet == [21] # SSH_MSG_NEWKEYS
+
+  # ok, we can also accept the new keys
+  cl.send_packet [21]
+
+  # and let's calculate the actual keys now / RFC 4253 / 7.2.
+  session_id = hash
+  iv_c2s  = SHA256 ssh_pmint(k) + hash + ["A"] + session_id
+  iv_s2c  = SHA256 ssh_pmint(k) + hash + ["B"] + session_id
+  key_c2s = SHA256 ssh_pmint(k) + hash + ["C"] + session_id
+  key_s2c = SHA256 ssh_pmint(k) + hash + ["D"] + session_id
+  itg_c2s = SHA256 ssh_pmint(k) + hash + ["E"] + session_id
+  itg_s2c = SHA256 ssh_pmint(k) + hash + ["F"] + session_id
+
+  cl.c2s_cipher = AES256_ctr(key_c2s, iv_c2s)
+  cl.c2s_mac = itg_c2s
 end
 
 
 STDOUT.sync = true
-server = TCPServer.new 22
+server = TCPServer.new 2020
 loop do
   Thread.start(server.accept) {|c| handle_client c}
 end
