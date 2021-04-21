@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 require 'socket'
 require 'openssl'
+require 'base64' # only used internally
 
 # i've split off the stuff that isn't specific to SSH into seperate files
 require_relative 'utility'
@@ -46,6 +47,7 @@ class TCPSocket
   # it just decrypts the bytes that it reads
   attr_accessor :c2s_mac
   attr_accessor :s2c_mac
+  attr_accessor :session_id
  
   def read_byte
     proxy_read(1).ord
@@ -180,8 +182,9 @@ def handle_client cl
     # always the same
     key_exchange cl, client_id, combined_payloads
 
-    cl.read_packet
-    cl.send_packet [6] + ssh_string("ssh-userauth")
+    authenticate cl
+
+    cl.read_packet.hexdump
   ensure
     cl.close
   end
@@ -324,13 +327,13 @@ def key_exchange cl, client_id, combined_payloads
   cl.send_packet [21]
 
   # and let's calculate the actual keys now / RFC 4253 / 7.2.
-  session_id = hash
-  iv_c2s  = SHA256 ssh_pmint(k) + hash + ["A"] + session_id
-  iv_s2c  = SHA256 ssh_pmint(k) + hash + ["B"] + session_id
-  key_c2s = SHA256 ssh_pmint(k) + hash + ["C"] + session_id
-  key_s2c = SHA256 ssh_pmint(k) + hash + ["D"] + session_id
-  itg_c2s = SHA256 ssh_pmint(k) + hash + ["E"] + session_id
-  itg_s2c = SHA256 ssh_pmint(k) + hash + ["F"] + session_id
+  cl.session_id = hash
+  iv_c2s  = SHA256 ssh_pmint(k) + hash + ["A"] + cl.session_id
+  iv_s2c  = SHA256 ssh_pmint(k) + hash + ["B"] + cl.session_id
+  key_c2s = SHA256 ssh_pmint(k) + hash + ["C"] + cl.session_id
+  key_s2c = SHA256 ssh_pmint(k) + hash + ["D"] + cl.session_id
+  itg_c2s = SHA256 ssh_pmint(k) + hash + ["E"] + cl.session_id
+  itg_s2c = SHA256 ssh_pmint(k) + hash + ["F"] + cl.session_id
 
   cl.c2s_cipher = AES256_ctr(key_c2s, iv_c2s)
   cl.c2s_mac = itg_c2s
@@ -338,9 +341,94 @@ def key_exchange cl, client_id, combined_payloads
   cl.s2c_mac = itg_s2c
 end
 
+def authenticate cl
+  # at this point the client will probably send us an authentication request
+  # i'm not sure if it can even send anything else, so i'll just panic if it does
+  # as i always do in unexpected situations
+
+  cl_payload = cl.read_packet
+  assert cl_payload == ([5] + ssh_string("ssh-userauth"))
+  #                      ^
+  #                      SSH_MSG_SERVICE_REQUEST
+
+  # ok, let's accept the service request
+  cl.send_packet ([6] + ssh_string("ssh-userauth"))
+  #                ^
+  #                SSH_MSG_SERVICE_ACCEPT
+
+  # and let's also send a banner, why not
+  cl.send_packet ([53] + ssh_string("A banner message\n") + ssh_string("en"))
+  #                ^
+  #                SSH_MSG_USERAUTH_BANNER
+
+  # the client send multiple auth requests
+  loop do
+    packet = cl.read_packet
+
+    assert packet.shift == 50 # SSH_MSG_USERAUTH_REQUEST
+    user    = packet.string
+    service = packet.string
+    method  = packet.string
+
+    puts "#{user} logging in for #{service} via #{method}"
+
+    if method == "publickey"
+      signature_included = packet.shift
+      algo = packet.string
+      pubkey = packet.string
+
+      fingerprint = Base64.encode64 pubkey
+      puts algo + " " + fingerprint
+
+      # let's assume that it's a valid key
+      if signature_included > 0
+        signature_blob = packet.string.bytes
+        assert algo == signature_blob.string # the blob begins with the algo string
+        signature = signature_blob.string.bytes # then the actual signature follows
+
+        blob  = ssh_string cl.session_id.map(&:chr).join
+        blob += [50]
+        blob += ssh_string user
+        blob += ssh_string service
+        blob += ssh_string "publickey"
+        blob += [1]
+        blob += ssh_string algo
+        blob += ssh_string pubkey
+
+        pubkey = pubkey.bytes
+        assert algo == pubkey.string
+
+        e = pubkey.mpint
+        n = pubkey.mpint
+
+        assert rsa_verify n, e, blob, signature
+        puts "key verified"
+        cl.send_packet [52] # SSH_MSG_USERAUTH_SUCCESS
+        break
+      else
+        # not fully tested, TODO
+        # confirm that the key is ok
+        response  = [60] # SSH_MSG_USERAUTH_PK_OK
+        response += ssh_string algo
+        response += ssh_string pubkey
+        cl.send_packet response
+        next
+      end
+    end
+
+    response  = [51] # SSH_MSG_USERAUTH_FAILURE
+    response += ssh_string "publickey"
+    response += [0] # false
+    cl.send_packet response
+  end
+end
 
 STDOUT.sync = true
 server = TCPServer.new 2020
 loop do
   Thread.start(server.accept) {|c| handle_client c}
 end
+
+# todo list:
+# create all the SSH_MSG contants
+# ssh_namelist instead of the ssh_string hack
