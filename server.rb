@@ -181,10 +181,48 @@ def handle_client cl
     # everything, i don't have to pass the negotiated algos around - they're
     # always the same
     key_exchange cl, client_id, combined_payloads
-
     authenticate cl
 
-    cl.read_packet.hexdump
+    # main loop
+    loop do
+      packet = cl.read_packet
+      type = packet.shift
+      case type
+      when 90 # SSH_MSG_CHANNEL_OPEN
+        packet.hexdump
+        chan_type   = packet.string
+        client_chan = packet.uint32
+        p window_size = packet.uint32
+        p packet_size = packet.uint32
+        case chan_type
+        when "session"
+          server_chan = 0
+          cl.send_packet [91] + # SSH_MSG_CHANNEL_OPEN_CONFIRMATION
+                         ssh_uint32(client_chan) +
+                         ssh_uint32(server_chan) +
+                         ssh_uint32(1024 ** 2) + # initial window size
+                         ssh_uint32(32768) # maximum packet size, min 32768
+        else
+          cl.send_packet [92] + # SSH_MSG_CHANNEL_OPEN_FAILURE
+                         ssh_uint32(recipent_chan) +
+                         ssh_uint32(3) +
+                         ssh_string("not supported") +
+                         ssh_string("en")
+        end
+
+      when 94 # SSH_MSG_CHANNEL_DATA
+        chan = packet.uint32
+        str = packet.string
+        puts "#{chan}: #{str}"
+        cl.send_packet [94] +
+                       ssh_uint32(chan) +
+                       ssh_string(str)
+
+      else
+        puts "UNKNOWN MESSAGE #{type}:"
+        packet.hexdump
+      end
+    end
   ensure
     cl.close
   end
